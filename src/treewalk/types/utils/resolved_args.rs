@@ -121,6 +121,10 @@ impl ResolvedArguments {
         self.args[index].clone()
     }
 
+    pub fn get_arg_optional(&self, index: usize) -> Option<ExprResult> {
+        self.args.get(index).cloned()
+    }
+
     /// Return a `Dict` of all the keyword arguments.
     #[allow(clippy::mutable_key_type)]
     pub fn get_kwargs(&self) -> HashMap<ExprResult, ExprResult> {

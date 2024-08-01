@@ -15,7 +15,7 @@ use crate::parser::Parser;
 use crate::treewalk::types::{
     function::FunctionType,
     iterators::GeneratorIterator,
-    traits::{Callable, MemberAccessor},
+    traits::{Callable, MemberReader},
     utils::{Dunder, ResolvedArguments},
     Bytes, Class, Coroutine, Dict, ExprResult, Function, Generator, List, Module, Set, Slice, Str,
     Tuple,
@@ -227,7 +227,7 @@ impl Interpreter {
             format!("Member access {}.{}", result, field)
         });
         result
-            .as_member_accessor(self)
+            .as_member_reader(self)
             .get_member(self, field)?
             .ok_or(InterpreterError::AttributeError(
                 result.get_class(self).borrow().name.clone(),
@@ -387,13 +387,31 @@ impl Interpreter {
                 }
                 Expr::MemberAccess { object, field } => {
                     let result = self.evaluate_expr(object)?;
-                    result.as_member_accessor(self).delete_member(field).ok_or(
-                        InterpreterError::AttributeError(
-                            result.get_class(self).borrow().name.clone(),
-                            field.clone(),
-                            self.state.call_stack(),
-                        ),
-                    )?;
+
+                    // A delete operation will throw an error if that field is not present in the
+                    // instance's `Dunder::Dict`, meaning we should not do a class+MRO lookup which
+                    // would happen if we called get_member.
+                    // if result
+                    //     .as_member_reader(self)
+                    //     .get_member(self, Dunder::Dict.value())?
+                    //     .unwrap()
+                    //     .as_dict()
+                    //     .unwrap()
+                    //     .getitem(self, ExprResult::String(Str::new(field.to_owned())))?
+                    //     .is_none()
+                    // {
+                    //     return Err(InterpreterError::AttributeError(
+                    //         result.get_class(self).borrow().name.clone(),
+                    //         field.clone(),
+                    //         self.state.call_stack(),
+                    //     ));
+                    // }
+
+                    // TODO test this error
+                    result
+                        .as_member_writer()
+                        .unwrap()
+                        .delete_member(self, field)?;
                 }
                 _ => return Err(InterpreterError::ExpectedVariable(self.state.call_stack())),
             }
@@ -652,8 +670,10 @@ impl Interpreter {
             }
             Expr::MemberAccess { object, field } => {
                 self.evaluate_expr(object)?
-                    .as_member_accessor(self)
-                    .set_member(field, value);
+                    // TODO test this error
+                    .as_member_writer()
+                    .unwrap()
+                    .set_member(self, field, value)?;
             }
             Expr::IndexAccess { object, index } => {
                 let index_result = self.evaluate_expr(index)?;
@@ -4477,6 +4497,29 @@ w = { key for key, value in a.items() }
                 );
             }
         }
+
+        let input = r#"
+a = { "b": 4, 'c': 5 }
+b = a.get("b")
+c = a.get("d")
+d = a.get("d", 99)
+"#;
+        let (mut parser, mut interpreter) = init(input);
+
+        match interpreter.run(&mut parser) {
+            Err(e) => panic!("Interpreter error: {:?}", e),
+            Ok(_) => {
+                assert_eq!(
+                    interpreter.state.read("b"),
+                    Some(ExprResult::Integer(4.store()))
+                );
+                assert_eq!(interpreter.state.read("c"), Some(ExprResult::None));
+                assert_eq!(
+                    interpreter.state.read("d"),
+                    Some(ExprResult::Integer(99.store()))
+                );
+            }
+        }
     }
 
     #[test]
@@ -6643,6 +6686,8 @@ a = type
 b = type.__dict__
 c = type(type.__dict__)
 d = type(dict.__dict__['fromkeys'])
+# TODO this should fail
+e = type(object().__dict__)
 "#;
         let (mut parser, mut interpreter) = init(input);
 
@@ -6664,6 +6709,10 @@ d = type(dict.__dict__['fromkeys'])
                 assert_eq!(
                     interpreter.state.read("d").unwrap().as_class().unwrap(),
                     interpreter.state.get_type_class(Type::BuiltinMethod)
+                );
+                assert_eq!(
+                    interpreter.state.read("e").unwrap().as_class().unwrap(),
+                    interpreter.state.get_type_class(Type::Dict)
                 );
             }
         }
@@ -8700,6 +8749,64 @@ a = obj.attribute
                 assert_eq!(
                     interpreter.state.read("a"),
                     Some(ExprResult::Integer(44.store()))
+                );
+            }
+        }
+
+        let input = r#"
+class Descriptor:
+    def __init__(self, name=None, default=None):
+        self.name = name
+        self.default = default
+
+    def __get__(self, instance, owner):
+        if instance is None:
+            return self
+        return instance.__dict__.get(self.name, self.default)
+
+    def __set__(self, instance, value):
+        print(instance)
+        print(instance.__dict__)
+        instance.__dict__[self.name] = "fake out"
+        print(instance.__dict__)
+
+    def __delete__(self, instance):
+        if self.name in instance.__dict__:
+            del instance.__dict__[self.name]
+
+class MyClass:
+    my_attr = Descriptor('my_attr', 'default value')
+
+    def __init__(self, value=None):
+        if value:
+            self.my_attr = value
+
+obj = MyClass()
+a = obj.my_attr
+
+obj.my_attr = 'new value'
+b = obj.my_attr
+
+del obj.my_attr
+c = obj.my_attr
+"#;
+
+        let (mut parser, mut interpreter) = init(input);
+
+        match interpreter.run(&mut parser) {
+            Err(e) => panic!("Interpreter error: {:?}", e),
+            Ok(_) => {
+                assert_eq!(
+                    interpreter.state.read("a"),
+                    Some(ExprResult::String(Str::new("default value".into())))
+                );
+                assert_eq!(
+                    interpreter.state.read("b"),
+                    Some(ExprResult::String(Str::new("fake out".into())))
+                );
+                assert_eq!(
+                    interpreter.state.read("a"),
+                    Some(ExprResult::String(Str::new("default value".into())))
                 );
             }
         }

@@ -4,6 +4,7 @@ use std::hash::{Hash, Hasher};
 
 #[cfg(feature = "c_stdlib")]
 use super::cpython::{CPythonClass, CPythonModule, CPythonObject};
+use super::traits::MemberWriter;
 use crate::core::{Container, Voidable};
 use crate::treewalk::Interpreter;
 use crate::types::errors::InterpreterError;
@@ -13,7 +14,7 @@ use super::{
         DictItemsIterator, DictKeysIterator, DictValuesIterator, GeneratorIterator, ListIterator,
         RangeIterator, ReversedIterator, StringIterator, ZipIterator,
     },
-    traits::{Callable, IndexRead, IndexWrite, MemberAccessor, NonDataDescriptor},
+    traits::{Callable, DataDescriptor, IndexRead, IndexWrite, MemberReader, NonDataDescriptor},
     types::TypeExpr,
     utils::{BuiltinObject, Dunder, ResolvedArguments},
     ByteArray, Bytes, Cell, Class, Classmethod, Code, Complex, Coroutine, Dict, DictItems,
@@ -41,7 +42,7 @@ pub enum ExprResult {
     Classmethod(Classmethod),
     Staticmethod(Staticmethod),
     Property(Property),
-    DataDescriptor,
+    DataDescriptor(Container<Box<dyn DataDescriptor>>),
     NonDataDescriptor(Container<Box<dyn NonDataDescriptor>>),
     Function(Container<Function>),
     Method(Container<Method>),
@@ -126,6 +127,7 @@ impl PartialEq for ExprResult {
             (ExprResult::Object(_), ExprResult::Object(_)) => unreachable!(),
             (ExprResult::Exception(a), ExprResult::Exception(b)) => a == b,
             (ExprResult::BuiltinMethod(a), ExprResult::BuiltinMethod(b)) => a.same_identity(b),
+            (ExprResult::DataDescriptor(a), ExprResult::DataDescriptor(b)) => a.same_identity(b),
             (ExprResult::NonDataDescriptor(a), ExprResult::NonDataDescriptor(b)) => {
                 a.same_identity(b)
             }
@@ -190,7 +192,7 @@ impl ExprResult {
             ExprResult::Classmethod(_) => write!(f, "<classmethod>"),
             ExprResult::Staticmethod(_) => write!(f, "<staticmethod>"),
             ExprResult::Property(_) => write!(f, "<property>"),
-            ExprResult::DataDescriptor => write!(f, "<attribute <> of <> objects>"),
+            ExprResult::DataDescriptor(_) => write!(f, "<attribute <> of <> objects>"),
             ExprResult::NonDataDescriptor(_) => {
                 write!(f, "<non-data attribute <> of <> objects>")
             }
@@ -304,7 +306,7 @@ impl ExprResult {
             ExprResult::Classmethod(_) => Type::Classmethod,
             ExprResult::Staticmethod(_) => Type::Staticmethod,
             ExprResult::Property(_) => Type::Property,
-            ExprResult::DataDescriptor => Type::GetSetDescriptor,
+            ExprResult::DataDescriptor(_) => Type::GetSetDescriptor,
             ExprResult::NonDataDescriptor(_) => Type::MemberDescriptor,
             ExprResult::Method(_) => Type::Method,
             ExprResult::Function(_) => Type::Function,
@@ -403,7 +405,7 @@ impl ExprResult {
         }
     }
 
-    pub fn as_module(&self) -> Option<Box<dyn MemberAccessor>> {
+    pub fn as_module(&self) -> Option<Box<dyn MemberReader>> {
         match self {
             ExprResult::Module(i) => Some(Box::new(i.borrow().clone())),
             #[cfg(feature = "c_stdlib")]
@@ -412,9 +414,7 @@ impl ExprResult {
         }
     }
 
-    /// Besides `Object` and `Class`, this should only be used immutable access. We need to
-    /// implement `MemberAccessor` for `Container<T>` rather than `T` for mutable access.
-    pub fn as_member_accessor(&self, interpreter: &Interpreter) -> Box<dyn MemberAccessor> {
+    pub fn as_member_reader(&self, interpreter: &Interpreter) -> Box<dyn MemberReader> {
         match self {
             ExprResult::Object(i) => Box::new(i.clone()),
             ExprResult::Class(i) => Box::new(i.clone()),
@@ -429,10 +429,34 @@ impl ExprResult {
                 // i.e. [].append
                 // All attributes fetched off the builtin types not explicitly handled above do not
                 // support attribute writes, only reads of builtin attributes.
-                // We could split this into MemberRead versus MemberWrite in the future.
                 let class = interpreter.state.get_type_class(self.get_type());
                 Box::new(BuiltinObject::new(self.clone(), class))
             }
+        }
+    }
+
+    pub fn as_member_writer(&self) -> Option<Box<dyn MemberWriter>> {
+        match self {
+            ExprResult::Object(i) => Some(Box::new(i.clone())),
+            ExprResult::Class(i) => Some(Box::new(i.clone())),
+            ExprResult::Function(i) => Some(Box::new(i.clone())),
+            // #[cfg(feature = "c_stdlib")]
+            // ExprResult::CPythonModule(i) => Some(Box::new(i.borrow().clone())),
+            _ => None,
+        }
+    }
+
+    fn hasattr(&self, interpreter: &Interpreter, attr: Dunder) -> bool {
+        self.as_member_reader(interpreter)
+            .get_member(interpreter, attr.value())
+            .unwrap()
+            .is_some()
+    }
+
+    fn map_hasattr(&self, interpreter: &Interpreter, attr: Dunder) -> Option<ExprResult> {
+        match self.hasattr(interpreter, attr) {
+            true => Some(self.clone()),
+            false => None,
         }
     }
 
@@ -443,21 +467,17 @@ impl ExprResult {
             ExprResult::Dict(dict) => Some(Box::new(dict.clone())),
             ExprResult::MappingProxy(proxy) => Some(Box::new(proxy.clone())),
             ExprResult::String(s) => Some(Box::new(s.clone())),
-            ExprResult::Object(i) => {
-                match i
-                    .get_member(interpreter, Dunder::GetItem.value())
-                    .unwrap()
-                    .is_some()
-                {
-                    true => Some(Box::new(i.clone())),
-                    false => None,
-                }
-            }
+            ExprResult::Object(i) => self
+                .map_hasattr(interpreter, Dunder::GetItem)
+                .map(|_| Box::new(i.clone()) as Box<dyn IndexRead>),
             #[cfg(feature = "c_stdlib")]
             ExprResult::CPythonObject(o) => match o.hasattr(Dunder::GetItem.value()) {
                 true => Some(Box::new(o.clone())),
                 false => None,
             },
+            // ExprResult::CPythonObject(i) => self
+            //     .map_hasattr(interpreter, Dunder::GetItem)
+            //     .map(|_| Box::new(i.clone()) as Box<dyn IndexRead>),
             _ => None,
         }
     }
@@ -466,21 +486,17 @@ impl ExprResult {
         match self {
             ExprResult::List(list) => Some(Box::new(list.clone())),
             ExprResult::Dict(dict) => Some(Box::new(dict.clone())),
-            ExprResult::Object(i) => {
-                match i
-                    .get_member(interpreter, Dunder::SetItem.value())
-                    .unwrap()
-                    .is_some()
-                {
-                    true => Some(Box::new(i.clone())),
-                    false => None,
-                }
-            }
+            ExprResult::Object(i) => self
+                .map_hasattr(interpreter, Dunder::SetItem)
+                .map(|_| Box::new(i.clone()) as Box<dyn IndexWrite>),
             #[cfg(feature = "c_stdlib")]
             ExprResult::CPythonObject(o) => match o.hasattr(Dunder::SetItem.value()) {
                 true => Some(Box::new(o.clone())),
                 false => None,
             },
+            // ExprResult::CPythonObject(i) => self
+            //     .map_hasattr(interpreter, Dunder::SetItem)
+            //     .map(|_| Box::new(i.clone()) as Box<dyn IndexWrite>),
             _ => None,
         }
     }
@@ -492,18 +508,15 @@ impl ExprResult {
         }
     }
 
-    fn as_member_descriptor(
+    fn as_nondata_descriptor(
         &self,
         interpreter: &Interpreter,
     ) -> Result<Option<Container<Box<dyn NonDataDescriptor>>>, InterpreterError> {
         Ok(match self {
             ExprResult::NonDataDescriptor(i) => Some(i.clone()),
-            ExprResult::Object(i) => {
-                match i.get_member(interpreter, Dunder::Get.value())?.is_some() {
-                    true => Some(Container::new(Box::new(i.clone()))),
-                    false => None,
-                }
-            }
+            ExprResult::Object(i) => self
+                .map_hasattr(interpreter, Dunder::Get)
+                .map(|_| Container::new(Box::new(i.clone()) as Box<dyn NonDataDescriptor>)),
             ExprResult::Classmethod(i) => Some(Container::new(Box::new(i.clone()))),
             ExprResult::Staticmethod(i) => Some(Container::new(Box::new(i.clone()))),
             ExprResult::Property(i) => Some(Container::new(Box::new(i.clone()))),
@@ -511,7 +524,20 @@ impl ExprResult {
         })
     }
 
-    pub fn resolve_descriptor(
+    pub fn as_data_descriptor(
+        &self,
+        interpreter: &Interpreter,
+    ) -> Result<Option<Container<Box<dyn DataDescriptor>>>, InterpreterError> {
+        Ok(match self {
+            ExprResult::Object(i) => self
+                .map_hasattr(interpreter, Dunder::Set)
+                .map(|_| Container::new(Box::new(i.clone()) as Box<dyn DataDescriptor>)),
+            // ExprResult::Property(i) => Some(Container::new(Box::new(i.clone()))),
+            _ => None,
+        })
+    }
+
+    pub fn resolve_nondata_descriptor(
         &self,
         interpreter: &Interpreter,
         instance: Option<ExprResult>,
@@ -534,7 +560,7 @@ impl ExprResult {
             });
         }
 
-        match self.as_member_descriptor(interpreter)? {
+        match self.as_nondata_descriptor(interpreter)? {
             Some(descriptor) => descriptor.borrow().get_attr(interpreter, instance, owner),
             None => Ok(self.clone()),
         }
@@ -567,13 +593,15 @@ impl ExprResult {
         }
     }
 
+    // TODO this can probably just return a bool
     pub fn as_boolean(&self) -> Option<bool> {
         match self {
             ExprResult::Boolean(i) => Some(*i),
             ExprResult::List(i) => Some(i.borrow().len() > 0),
             ExprResult::String(i) => Some(!i.0.is_empty()),
             ExprResult::Integer(i) => Some(*i.borrow() != 0),
-            _ => None,
+            ExprResult::None => Some(false),
+            _ => Some(true),
         }
     }
 
